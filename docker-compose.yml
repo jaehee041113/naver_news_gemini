@@ -1,0 +1,11 @@
+services:
+  news-bot:
+    build: .
+    container_name: news-summary-bot
+    ports:
+      - "7860:7860"
+    volumes:
+      - .:/app
+    env_file:
+      - .gemini_env
+    restart: unless-stopped
