@@ -1,232 +1,213 @@
 import os
 import re
+import html
 import requests
 import pandas as pd
 import gradio as gr
-
 from dotenv import load_dotenv
 from google import genai
-from bs4 import BeautifulSoup as bs
 
+# -----------------------------
+# 1) 환경변수 로드 (.env_gemini)
+# -----------------------------
 load_dotenv("./.gemini_env")
 
+USER_ID = os.getenv("Client_Id")
+USER_SECRET = os.getenv("Client_Secret")
+GEMINI_API_KEY = os.getenv("google_api_key")
 
-# ---------------------------
-# 텍스트 정리 함수
-# ---------------------------
-def text_clean(text):
-    temp = re.sub(r"</?[^>]+>", "", str(text))
-    temp = re.sub(r"[^가-힣a-zA-Z0-9]", " ", temp)
-    temp = re.sub(r"\s+", " ", temp).strip()
-    return temp
+# -----------------------------
+# 2) 텍스트 정제 함수
+# -----------------------------
+def text_clean(text: str) -> str:
+    if text is None:
+        return ""
+    # HTML 태그 제거
+    text = re.sub(r"<.*?>", "", text)
+    # HTML 엔티티(&quot; 등) 복원
+    text = html.unescape(text)
+    return text.strip()
 
+# -----------------------------
+# 3) 네이버 뉴스 수집 함수
+# -----------------------------
+def fetch_naver_news(keyword: str,
+                     display: int = 50,
+                     max_pages: int = 2) -> pd.DataFrame:
+    """
+    keyword로 네이버 뉴스 검색 후 DataFrame 반환
+    - display: 페이지당 결과 수 (최대 100)
+    - max_pages: 가져올 최대 페이지 수
+    """
+    if not USER_ID or not USER_SECRET:
+        raise RuntimeError("user_id / user_secret 환경변수가 설정되어 있지 않습니다.")
 
-# ---------------------------
-# 네이버 뉴스 검색 함수
-# ---------------------------
-def search_news(keyword):
     url = "https://openapi.naver.com/v1/search/news"
-    payload = {
-        "query": keyword,
-        "display": 10,   # 우선 10개만
-        "start": 1,
-        "sort": "date"
-    }
     headers = {
-        "X-Naver-Client-Id": os.getenv("Client_Id"),
-        "X-Naver-Client-Secret": os.getenv("Client_Secret")
+        "X-Naver-Client-Id": USER_ID,
+        "X-Naver-Client-Secret": USER_SECRET,
     }
 
-    r = requests.get(url, params=payload, headers=headers, timeout=10)
-    r.raise_for_status()
+    all_items = []
 
-    data = r.json()
-    items = data.get("items", [])
+    # 1페이지 먼저 요청해서 total 확인
+    payload = dict(query=keyword, display=display, start=1, sort="date")
+    r = requests.get(url, params=payload, headers=headers)
+    if r.status_code != 200:
+        raise RuntimeError(f"네이버 API 오류: {r.status_code}, {r.text}")
+
+    response = r.json()
+    total = response.get("total", 0)
+    if total == 0:
+        return pd.DataFrame()
+
+    total_pages = total // display + 1
+    total_pages = min(total_pages, max_pages)
+
+    all_items.extend(response.get("items", []))
+
+    for page in range(2, total_pages + 1):
+        start = (page - 1) * display + 1
+        if start > 1000:  # 네이버 뉴스 API start 최대 1000
+            break
+
+        payload = dict(query=keyword, display=display, start=start, sort="date")
+        r = requests.get(url, params=payload, headers=headers)
+        if r.status_code != 200:
+            print(f"[경고] {page}페이지 요청 실패: {r.status_code}")
+            break
+
+        resp = r.json()
+        items = resp.get("items", [])
+        if not items:
+            break
+        all_items.extend(items)
 
     result = {}
-    for item in items:
+    for item in all_items:
         for key, value in item.items():
-            if key in ("title", "description"):
-                value = text_clean(value)
-            result.setdefault(key, []).append(value)
-
-    if not result:
-        return pd.DataFrame(columns=["title", "originallink"])
+            if key in ["title", "description"]:
+                result.setdefault(key, []).append(text_clean(value))
+            else:
+                result.setdefault(key, []).append(value)
 
     df = pd.DataFrame(result)
+    return df
 
-    needed_cols = [col for col in ["title", "originallink"] if col in df.columns]
-    return df[needed_cols].head(10)
+# -----------------------------
+# 4) Gemini 요약 함수
+# -----------------------------
+def summarize_with_gemini(df: pd.DataFrame, keyword: str) -> str:
+    if GEMINI_API_KEY is None:
+        raise RuntimeError("GEMINI_API_KEY 환경변수가 설정되어 있지 않습니다.")
 
+    client = genai.Client(api_key=GEMINI_API_KEY)
 
-# ---------------------------
-# 뉴스 본문 추출 함수
-# ---------------------------
-def content_extract(news_df):
-    full_text = ""
-    collected_links = []
+    if df.empty:
+        return f"'{keyword}' 키워드로 수집된 뉴스가 없습니다."
 
-    if news_df is None or news_df.empty:
-        return full_text, collected_links
+    # 너무 길어지지 않도록 상위 20개만 사용
+    df_use = df.head(20)
 
-    for link in news_df["originallink"]:
-        try:
-            r = requests.get(link, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
-            r.raise_for_status()
-        except Exception:
-            continue
+    news_lines = []
+    for i, row in df_use.iterrows():
+        title = row.get("title", "")
+        desc = row.get("description", "")
+        link = row.get("link", "")
+        line = f"{i+1}. 제목: {title}\n   요약: {desc}\n   링크: {link}"
+        news_lines.append(line)
 
-        soup = bs(r.text, "lxml")
-
-        # id나 class에 content가 포함된 태그 전부 탐색
-        paragraphs = soup.select('[id*="content"], [class*="content"]')
-
-        page_text = []
-        for tag in paragraphs:
-            txt = text_clean(tag.get_text(" ", strip=True))
-            if len(txt) > 20:
-                page_text.append(txt)
-
-        if page_text:
-            full_text += " ".join(page_text) + "\n"
-            collected_links.append(link)
-
-    return full_text.strip(), collected_links
-
-
-# ---------------------------
-# Gemini 요약 함수
-# ---------------------------
-def summary_gemini(full_text):
-    if not full_text.strip():
-        return "본문을 추출하지 못했습니다. 다른 키워드로 다시 시도해 주세요."
+    news_text = "\n\n".join(news_lines)
 
     prompt = f"""
-다음 뉴스 기사들을 주제별로 분류해서 한국어로 정리해줘.
+다음은 '{keyword}' 키워드로 수집한 네이버 뉴스 목록입니다.
 
-요구사항:
-1. 주제별로 묶어라.
-2. 각 주제 요약은 500자 이내로 작성해라.
-3. 마지막에는 '핀테크 분야 영향'과 '경제 전반 영향'을 구분해서 자세히 분석해라.
-4. 전체 답변은 보기 쉽게 제목과 항목을 나눠서 작성해라.
+{news_text}
 
-기사 원문:
-{full_text}
+위 기사들을 바탕으로 다음 내용을 한국어로 정리해줘.
+
+1) 전체 뉴스를 5~7줄 정도로 핵심만 요약
+2) 주요 이슈/논점이 무엇인지 정리
+3) 전반적인 분위기(긍정/부정/중립)를 한 줄로 평가
+4) 추가로 눈에 띄는 서브 이슈가 있다면 2~3개 정도 bullet로 정리
+5) 수집된 기사와 키워드의 주가를 분석해서 향후 주가에 미칠 영향 알려줘
 """
-
-    api_key = os.getenv("google_api_key")
-    client = genai.Client(api_key=api_key)
 
     response = client.models.generate_content(
-        model="gemini-3-flash-preview",
+        model="gemini-2.5-flash",
         contents=prompt
     )
-
     return response.text
 
-
-# ---------------------------
-# 챗봇 응답 함수
-# ---------------------------
-def chatbot_response(message, history):
-    keyword = message.strip()
-
+# -----------------------------
+# 5) Gradio용 파이프라인 함수
+# -----------------------------
+def run_pipeline(keyword: str,
+                 max_pages: int = 2,
+                 display: int = 50):
+    keyword = keyword.strip()
     if not keyword:
-        return "검색할 키워드를 입력해 주세요."
+        return "키워드를 입력하세요.", pd.DataFrame()
 
     try:
-        news_df = search_news(keyword)
+        df = fetch_naver_news(keyword, display=display, max_pages=max_pages)
+    except Exception as e:
+        return f"네이버 뉴스 수집 중 오류 발생:\n{e}", pd.DataFrame()
 
-        if news_df.empty:
-            return f"'{keyword}'에 대한 뉴스 검색 결과가 없습니다."
+    if df.empty:
+        return f"'{keyword}' 키워드로 뉴스가 없습니다.", pd.DataFrame()
 
-        full_text, used_links = content_extract(news_df)
+    try:
+        summary = summarize_with_gemini(df, keyword)
+    except Exception as e:
+        return f"Gemini 요약 중 오류 발생:\n{e}", df[["title", "link"]]
 
-        if not full_text:
-            return (
-                f"'{keyword}' 뉴스는 찾았지만 본문 추출에 실패했어요.\n\n"
-                "가능한 원인:\n"
-                "- 언론사 페이지 구조가 달라서 본문 선택이 안 됨\n"
-                "- 접속 차단 또는 동적 렌더링 페이지\n"
-            )
+    # 프리뷰용으로 제목+링크만 보여줌
+    preview_df = df[["title", "link"]].head(50)
 
-        summary = summary_gemini(full_text)
+    return summary, preview_df
 
-        news_list_text = "\n".join(
-            [f"{i+1}. {title}" for i, title in enumerate(news_df["title"].tolist())]
+# -----------------------------
+# 6) Gradio 인터페이스 정의
+# -----------------------------
+with gr.Blocks(title="네이버 뉴스 + Gemini 요약") as demo:
+    gr.Markdown("## 🔍 키워드 기반 네이버 뉴스 요약 서비스\n\n"
+                "키워드를 입력하면 네이버 뉴스에서 기사를 가져와서 Gemini로 요약해줍니다.")
+
+    with gr.Row():
+        keyword_input = gr.Textbox(
+            label="검색 키워드",
+            placeholder="예) 핀테크, 인공지능, 비트코인 ..."
+        )
+    with gr.Row():
+        max_pages_input = gr.Slider(
+            minimum=1,
+            maximum=5,
+            value=2,
+            step=1,
+            label="가져올 페이지 수 (페이지당 display개)"
+        )
+        display_input = gr.Slider(
+            minimum=10,
+            maximum=100,
+            value=50,
+            step=10,
+            label="페이지당 기사 수 (display)"
         )
 
-        link_text = "\n".join([f"- {link}" for link in used_links[:10]])
+    run_button = gr.Button("뉴스 수집 & 요약 실행")
 
-        final_answer = f"""검색 키워드: {keyword}
+    summary_output = gr.Markdown(label="Gemini 요약 결과")
+    table_output = gr.Dataframe(label="수집된 뉴스 (제목 + 링크)")
 
-[검색된 뉴스 제목]
-{news_list_text}
-
-[요약 및 분석]
-{summary}
-
-[본문 추출에 사용된 링크]
-{link_text}
-"""
-        return final_answer
-
-    except Exception as e:
-        return f"오류가 발생했습니다: {type(e).__name__}: {e}"
-
-
-# ---------------------------
-# 예시 입력
-# ---------------------------
-examples = [
-    ["삼성전자"],
-    ["카카오페이"],
-    ["비트코인"],
-    ["금리"],
-    ["핀테크"]
-]
-
-
-# ---------------------------
-# Gradio UI
-# ---------------------------
-with gr.Blocks(title="뉴스 요약 챗봇") as demo:
-    gr.Markdown(
-        """
-# 뉴스 요약 챗봇
-네이버 뉴스 검색 결과를 모아서 기사 본문을 추출한 뒤,
-Gemini로 주제별 요약과 핀테크/경제 영향 분석을 제공합니다.
-"""
+    run_button.click(
+        fn=run_pipeline,
+        inputs=[keyword_input, max_pages_input, display_input],
+        outputs=[summary_output, table_output]
     )
 
-    chatbot = gr.Chatbot(height=500, type="messages")
-    msg = gr.Textbox(
-        label="검색 키워드 입력",
-        placeholder="예: 삼성전자, 비트코인, 금리, 핀테크"
-    )
-    clear_btn = gr.Button("대화 초기화")
-
-    gr.Examples(
-        examples=examples,
-        inputs=msg
-    )
-
-    def user_submit(user_message, history):
-        history = history or []
-        history.append({"role": "user", "content": user_message})
-        return "", history
-
-    def bot_submit(history):
-        user_message = history[-1]["content"]
-        bot_message = chatbot_response(user_message, history)
-        history.append({"role": "assistant", "content": bot_message})
-        return history
-
-    msg.submit(user_submit, [msg, chatbot], [msg, chatbot], queue=False).then(
-        bot_submit, chatbot, chatbot
-    )
-
-    clear_btn.click(lambda: [], None, chatbot, queue=False)
-
-if __name__=="__main__":
+# -----------------------------
+# 7) 실행
+# -----------------------------
+if __name__ == "__main__":
     demo.launch(server_name="0.0.0.0", server_port=7860)
